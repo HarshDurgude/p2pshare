@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <meta name="description" content="Simple peer-to-peer text sharing using WebRTC.">
+
+    <title>P2P Text Share</title>
+
+    <link rel="stylesheet" href="style.css">
+</head>
+
+
+<body>
+
+    <main class="app">
+
+        <!-- ============================= -->
+        <!-- HEADER -->
+        <!-- ============================= -->
+
+        <header class="header">
+
+            <div>
+                <h1>P2P Text Share</h1>
+
+                <p class="subtitle">
+                    Share text directly between devices.
+                </p>
+            </div>
+
+        </header>
+
+
+        <!-- ============================= -->
+        <!-- STATUS -->
+        <!-- ============================= -->
+
+        <section class="status-card">
+
+            <div class="status-row">
+
+                <span class="status-dot" id="connectionDot"></span>
+
+                <span id="connectionStatus">
+                    Not connected
+                </span>
+
+            </div>
+
+
+            <div class="system-status">
+
+                <span id="firebaseStatus">
+                    Firebase: connecting...
+                </span>
+
+                <span id="trafficStatus">
+                    Active users: checking...
+                </span>
+
+            </div>
+
+        </section>
+
+
+        <!-- ============================= -->
+        <!-- CONNECTION -->
+        <!-- ============================= -->
+
+        <section class="card" id="connectionCard">
+
+            <div class="card-header">
+
+                <div>
+
+                    <h2>Connect a device</h2>
+
+                    <p>
+                        Create a connection on one device,
+                        then scan the QR code from the other.
+                    </p>
+
+                </div>
+
+            </div>
+
+
+            <button id="createConnectionBtn" class="primary-button">
+                Create Connection
+            </button>
+
+
+            <!-- HOST INFORMATION -->
+
+            <div id="hostSection" class="host-section hidden">
+
+                <div class="room-label">
+                    Room code
+                </div>
+
+                <div id="roomCode" class="room-code">
+                    --------
+                </div>
+
+
+                <div class="qr-wrapper">
+
+                    <div id="qrCode"></div>
+
+                </div>
+
+
+                <p class="qr-help">
+                    Scan this QR code with the other device.
+                </p>
+
+
+                <button id="copyLinkBtn" class="secondary-button">
+                    Copy Connection Link
+                </button>
+
+
+                <div id="waitingMessage" class="waiting-message">
+                    Waiting for the other device...
+                </div>
+
+            </div>
+
+
+            <!-- AUTOMATIC JOIN INFORMATION -->
+
+            <div id="autoJoinSection" class="auto-join hidden">
+
+                <div class="join-icon">
+                    🔗
+                </div>
+
+                <h3>
+                    Joining connection
+                </h3>
+
+                <p id="joinMessage">
+                    Connecting to the other device...
+                </p>
+
+            </div>
+
+        </section>
+
+
+        <!-- ============================= -->
+        <!-- SEND -->
+        <!-- ============================= -->
+
+        <section class="card">
+
+            <div class="card-header">
+
+                <div>
+
+                    <h2>Send text</h2>
+
+                    <p>
+                        Paste a message, code, notes,
+                        or any other text.
+                    </p>
+
+                </div>
+
+            </div>
+
+
+            <textarea id="messageInput" class="text-input" placeholder="Paste or type your text here..."
+                spellcheck="false"></textarea>
+
+
+            <div class="input-footer">
+
+                <span id="characterCount">
+                    0 characters
+                </span>
+
+                <button id="sendButton" class="primary-button" disabled>
+                    Send
+                </button>
+
+            </div>
+
+        </section>
+
+
+        <!-- ============================= -->
+        <!-- RECEIVED -->
+        <!-- ============================= -->
+
+        <section class="card">
+
+            <div class="card-header">
+
+                <div>
+
+                    <h2>Received text</h2>
+
+                    <p>
+                        Text received from the other device.
+                    </p>
+
+                </div>
+
+                <button id="copyReceivedButton" class="small-button" disabled>
+                    Copy
+                </button>
+
+            </div>
+
+
+            <pre id="receivedText" class="received-text">Nothing received yet.</pre>
+
+        </section>
+
+
+        <!-- ============================= -->
+        <!-- FOOTER -->
+        <!-- ============================= -->
+
+        <footer class="footer">
+
+            <span>
+                WebRTC P2P
+            </span>
+
+            <span>•</span>
+
+            <span>
+                Firebase signaling only
+            </span>
+
+        </footer>
+
+    </main>
+
+
+    <!-- ============================= -->
+    <!-- FIREBASE / APPLICATION -->
+    <!-- ============================= -->
+
+    <script type="module" src="app.js"></script>
+
+</body>
+
+</html>
