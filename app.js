@@ -1678,84 +1678,34 @@ createConnectionBtn.addEventListener(
 // AUTOMATIC GUEST JOIN
 // ============================================================
 
-async function autoJoinRoom(
-    roomCode
-) {
+async function autoJoinRoom(roomCode) {
 
     try {
 
         await ensureFirebaseOnline();
 
 
-        // ----------------------------------------------------
-        // First check that the room exists and is not expired.
-        //
-        // We only read the metadata here.
-        // The offer itself remains protected.
-        // ----------------------------------------------------
-
-        const roomMetaRef =
-            ref(
-                db,
-                "rooms/" +
-                roomCode
-            );
-
-
-        const roomSnapshot =
-            await get(
-                roomMetaRef
-            );
-
-
-        if (
-            !roomSnapshot.exists()
-        ) {
-
-            throw new Error(
-                "Connection not found or expired."
-            );
-        }
-
-
-        const room =
-            roomSnapshot.val();
-
-
-        if (
-            !room.expiresAt ||
-            Date.now() >=
-            Number(room.expiresAt)
-        ) {
-
-            throw new Error(
-                "This connection has expired."
-            );
-        }
-
-
-        // ----------------------------------------------------
-        // Claim handshake slot.
-        // ----------------------------------------------------
+        // ====================================================
+        // 1. Claim a handshake slot FIRST
+        // ====================================================
 
         await claimHandshakeSlot();
 
 
-        currentRole =
-            "guest";
+        currentRole = "guest";
+
+        currentRoomCode = roomCode;
+
+        handshakeFinishStarted = false;
 
 
-        currentRoomCode =
-            roomCode;
-
-
-        handshakeFinishStarted =
-            false;
-
-
-        // ----------------------------------------------------
-        // Claim guest UID.
-        // ----------------------------------------------------
+        // ====================================================
+        // 2. Claim the guest position in the room
+        //
+        // This must happen BEFORE reading the room.
+        // The Firebase rules intentionally protect the room
+        // from arbitrary users.
+        // ====================================================
 
         const guestUidRef =
             ref(
@@ -1773,6 +1723,8 @@ async function autoJoinRoom(
 
                 currentValue => {
 
+                    // Nobody has joined yet.
+
                     if (
                         currentValue === null
                     ) {
@@ -1780,6 +1732,8 @@ async function autoJoinRoom(
                         return currentUser.uid;
                     }
 
+
+                    // We already claimed it.
 
                     if (
                         currentValue ===
@@ -1789,6 +1743,8 @@ async function autoJoinRoom(
                         return currentValue;
                     }
 
+
+                    // Somebody else is already using it.
 
                     return;
                 }
@@ -1805,28 +1761,60 @@ async function autoJoinRoom(
         }
 
 
-        // ----------------------------------------------------
-        // Now that guestUid belongs to us,
-        // read the protected offer.
-        // ----------------------------------------------------
+        // ====================================================
+        // 3. NOW we are authorized to read the room
+        // ====================================================
 
-        const offerRef =
+        const roomRef =
             ref(
                 db,
                 "rooms/" +
-                roomCode +
-                "/offer"
+                roomCode
             );
 
 
-        const offerSnapshot =
+        const roomSnapshot =
             await get(
-                offerRef
+                roomRef
             );
 
 
         if (
-            !offerSnapshot.exists()
+            !roomSnapshot.exists()
+        ) {
+
+            throw new Error(
+                "Connection not found or expired."
+            );
+        }
+
+
+        const room =
+            roomSnapshot.val();
+
+
+        // ====================================================
+        // 4. Check the one-minute expiration
+        // ====================================================
+
+        if (
+            !room.expiresAt ||
+            Date.now() >=
+            Number(room.expiresAt)
+        ) {
+
+            throw new Error(
+                "This connection has expired."
+            );
+        }
+
+
+        // ====================================================
+        // 5. Make sure an offer exists
+        // ====================================================
+
+        if (
+            !room.offer
         ) {
 
             throw new Error(
@@ -1835,9 +1823,9 @@ async function autoJoinRoom(
         }
 
 
-        const offer =
-            offerSnapshot.val();
-
+        // ====================================================
+        // 6. Create WebRTC connection
+        // ====================================================
 
         setConnectionStatus(
             "Creating secure P2P connection...",
@@ -1852,12 +1840,20 @@ async function autoJoinRoom(
         createPeerConnection();
 
 
+        // ====================================================
+        // 7. Apply PC's offer
+        // ====================================================
+
         await peerConnection.setRemoteDescription(
             JSON.parse(
-                offer
+                room.offer
             )
         );
 
+
+        // ====================================================
+        // 8. Create answer
+        // ====================================================
 
         const answer =
             await peerConnection.createAnswer();
@@ -1894,9 +1890,9 @@ async function autoJoinRoom(
         }
 
 
-        // ----------------------------------------------------
-        // Send answer.
-        // ----------------------------------------------------
+        // ====================================================
+        // 9. Send answer through Firebase
+        // ====================================================
 
         await set(
             ref(
@@ -1913,20 +1909,24 @@ async function autoJoinRoom(
             "Connection information sent. Waiting for P2P connection...";
 
 
+        // ====================================================
+        // 10. Start the one-minute safety timer
+        // ====================================================
+
         startHandshakeTimer();
 
 
-        // ----------------------------------------------------
-        // Watch the room.
+        // ====================================================
+        // 11. Watch the room
         //
-        // If host closes/crashes, onDisconnect()
-        // deletes the room and this listener detects it.
-        // ----------------------------------------------------
+        // If the host disappears and Firebase removes
+        // the room, the guest can cancel its handshake.
+        // ====================================================
 
         roomUnsubscribe =
             onValue(
 
-                roomMetaRef,
+                roomRef,
 
                 snapshot => {
 
@@ -1952,6 +1952,8 @@ async function autoJoinRoom(
             );
 
 
+        // Remove ?room=XXXX from the browser URL.
+
         clearRoomFromURL();
 
     }
@@ -1962,6 +1964,10 @@ async function autoJoinRoom(
             error
         );
 
+
+        // ====================================================
+        // Cleanup if anything failed
+        // ====================================================
 
         await releaseHandshakeSlot();
 
@@ -1977,20 +1983,21 @@ async function autoJoinRoom(
                 // Ignore.
             }
 
-            peerConnection =
-                null;
+            peerConnection = null;
         }
 
 
-        dataChannel =
-            null;
+        dataChannel = null;
 
 
-        currentRoomCode =
-            null;
+        currentRoomCode = null;
 
-        currentRole =
-            null;
+        currentRole = null;
+
+
+        handshakeActive = false;
+
+        stopHandshakeTimer();
 
 
         clearRoomFromURL();
@@ -2012,7 +2019,6 @@ async function autoJoinRoom(
         );
     }
 }
-
 
 // ============================================================
 // GUEST HANDSHAKE FAILURE
