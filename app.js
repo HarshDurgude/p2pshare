@@ -1,6 +1,3 @@
-
-
-
 // ============================================================
 // FIREBASE IMPORTS
 // ============================================================
@@ -22,19 +19,16 @@ import {
     onValue,
     onDisconnect,
     remove,
-    runTransaction
+    runTransaction,
+    update,
+    goOnline,
+    goOffline
 } from "https://www.gstatic.com/firebasejs/12.16.0/firebase-database.js";
 
 
 // ============================================================
 // FIREBASE CONFIG
 // ============================================================
-//
-// Keep the values from your Firebase project.
-// The databaseURL below is important because your database
-// is located in asia-southeast1.
-//
-
 
 const firebaseConfig = {
     apiKey: "AIzaSyBLXv-LsCbvbWeQUnuRvHOKRzdUOPEiqkU",
@@ -50,7 +44,7 @@ const firebaseConfig = {
 
 
 // ============================================================
-// FIREBASE INITIALIZATION
+// FIREBASE
 // ============================================================
 
 const firebaseApp =
@@ -64,10 +58,13 @@ const db =
 
 
 // ============================================================
-// APPLICATION SETTINGS
+// SETTINGS
 // ============================================================
 
-const MAX_ACTIVE_USERS = 40;
+const MAX_HANDSHAKES = 40;
+
+const ROOM_LIFETIME_MS =
+    60 * 1000; // 1 minute
 
 const MAX_SIGNALING_SIZE = 5000;
 
@@ -75,16 +72,8 @@ const ROOM_CODE_LENGTH = 10;
 
 
 // ============================================================
-// WEBRTC CONFIGURATION
+// WEBRTC
 // ============================================================
-//
-// STUN helps WebRTC discover the public network path.
-//
-// This does NOT carry your text data.
-//
-// The actual text still travels through the WebRTC
-// DataChannel.
-//
 
 const rtcConfiguration = {
 
@@ -101,7 +90,7 @@ const rtcConfiguration = {
 
 
 // ============================================================
-// GLOBAL STATE
+// STATE
 // ============================================================
 
 let currentUser = null;
@@ -110,21 +99,29 @@ let currentSlot = null;
 
 let currentRoomCode = null;
 
+let currentRole = null;
+
 let peerConnection = null;
 
 let dataChannel = null;
 
-let answerListener = null;
+let answerUnsubscribe = null;
 
-let roomListener = null;
+let roomUnsubscribe = null;
 
-let slotListener = null;
+let slotListenerUnsubscribe = null;
+
+let handshakeTimer = null;
+
+let handshakeActive = false;
+
+let firebaseOnline = true;
 
 let receivedTextValue = "";
 
 
 // ============================================================
-// DOM ELEMENTS
+// DOM
 // ============================================================
 
 const connectionDot =
@@ -150,11 +147,6 @@ const trafficStatus =
 const createConnectionBtn =
     document.getElementById(
         "createConnectionBtn"
-    );
-
-const connectionCard =
-    document.getElementById(
-        "connectionCard"
     );
 
 const hostSection =
@@ -219,7 +211,7 @@ const copyReceivedButton =
 
 
 // ============================================================
-// STATUS UI
+// STATUS
 // ============================================================
 
 function setConnectionStatus(
@@ -261,7 +253,7 @@ function setConnectionStatus(
 
 
 // ============================================================
-// FIREBASE STATUS UI
+// FIREBASE STATUS
 // ============================================================
 
 function setFirebaseStatus(
@@ -273,7 +265,7 @@ function setFirebaseStatus(
         text;
 
     firebaseStatus.className =
-        "firebase-status";
+        "";
 
 
     if (state === "success") {
@@ -300,7 +292,7 @@ function setFirebaseStatus(
 
 
 // ============================================================
-// GENERATE RANDOM ROOM CODE
+// ROOM CODE
 // ============================================================
 
 function generateRoomCode() {
@@ -335,19 +327,8 @@ function generateRoomCode() {
 
 
 // ============================================================
-// GET ROOM CODE FROM URL
+// URL
 // ============================================================
-//
-// GitHub Pages URL might be:
-//
-// https://username.github.io/p2p-text-share/
-//
-// So the QR contains the current page URL:
-//
-// https://username.github.io/p2p-text-share/?room=ABC123
-//
-// This works both locally and on GitHub Pages.
-//
 
 function getRoomFromURL() {
 
@@ -369,10 +350,6 @@ function getRoomFromURL() {
 }
 
 
-// ============================================================
-// REMOVE ROOM QUERY FROM URL
-// ============================================================
-
 function clearRoomFromURL() {
 
     const url =
@@ -391,10 +368,6 @@ function clearRoomFromURL() {
     );
 }
 
-
-// ============================================================
-// BUILD QR CONNECTION LINK
-// ============================================================
 
 function createConnectionLink(
     roomCode
@@ -417,7 +390,7 @@ function createConnectionLink(
 
 
 // ============================================================
-// INITIALIZE FIREBASE
+// FIREBASE INITIALIZATION
 // ============================================================
 
 async function initializeFirebase() {
@@ -446,8 +419,6 @@ async function initializeFirebase() {
         );
 
 
-        await claimTrafficSlot();
-
         startTrafficMonitoring();
 
     }
@@ -463,40 +434,149 @@ async function initializeFirebase() {
             "Firebase: connection error",
             "error"
         );
+    }
+}
 
 
-        setConnectionStatus(
-            "Unable to connect to Firebase",
-            "error"
+// ============================================================
+// MAKE SURE FIREBASE IS ONLINE
+// ============================================================
+
+async function ensureFirebaseOnline() {
+
+    if (!firebaseOnline) {
+
+        goOnline(db);
+
+        firebaseOnline =
+            true;
+
+        setFirebaseStatus(
+            "Firebase: reconnecting...",
+            "warning"
+        );
+
+        // Give the SDK a moment to reconnect.
+
+        await new Promise(
+            resolve =>
+                setTimeout(
+                    resolve,
+                    300
+                )
+        );
+
+
+        setFirebaseStatus(
+            "Firebase: connected",
+            "success"
         );
     }
 }
 
 
 // ============================================================
-// CLAIM TRAFFIC SLOT
+// ACTIVE HANDSHAKE MONITOR
 // ============================================================
-//
-// We intentionally limit the application to 40 active
-// Firebase-connected browsers.
-//
-// Firebase itself has a higher platform limit, but 40 is
-// our application's safety ceiling.
-//
 
-async function claimTrafficSlot() {
+function startTrafficMonitoring() {
 
-    if (!currentUser) {
+    if (slotListenerUnsubscribe) {
+        return;
+    }
+
+
+    const slotsRef =
+        ref(
+            db,
+            "slots"
+        );
+
+
+    slotListenerUnsubscribe =
+        onValue(
+
+            slotsRef,
+
+            (snapshot) => {
+
+                const slots =
+                    snapshot.val() || {};
+
+                const active =
+                    Object.keys(
+                        slots
+                    ).length;
+
+
+                trafficStatus.textContent =
+                    `Active handshakes: ${active}/${MAX_HANDSHAKES}`;
+
+
+                trafficStatus.className =
+                    "";
+
+
+                if (
+                    active >=
+                    MAX_HANDSHAKES
+                ) {
+
+                    trafficStatus.classList.add(
+                        "warning"
+                    );
+                }
+
+            },
+
+            (error) => {
+
+                console.error(
+                    "Traffic monitor error:",
+                    error
+                );
+
+
+                trafficStatus.textContent =
+                    "Active handshakes: unavailable";
+
+                trafficStatus.className =
+                    "error";
+            }
+        );
+}
+
+
+// ============================================================
+// CLAIM HANDSHAKE SLOT
+// ============================================================
+
+async function claimHandshakeSlot() {
+
+    if (
+        !currentUser
+    ) {
 
         throw new Error(
-            "User is not authenticated."
+            "Firebase authentication is not ready."
         );
     }
 
 
+    if (
+        currentSlot !== null
+    ) {
+
+        return;
+    }
+
+
+    await ensureFirebaseOnline();
+
+
     for (
         let slot = 1;
-        slot <= MAX_ACTIVE_USERS;
+        slot <= MAX_HANDSHAKES;
         slot++
     ) {
 
@@ -509,11 +589,10 @@ async function claimTrafficSlot() {
 
         const transaction =
             await runTransaction(
+
                 slotRef,
 
                 (currentValue) => {
-
-                    // Empty slot.
 
                     if (
                         currentValue === null
@@ -523,8 +602,6 @@ async function claimTrafficSlot() {
                     }
 
 
-                    // Already ours.
-
                     if (
                         currentValue ===
                         currentUser.uid
@@ -533,9 +610,6 @@ async function claimTrafficSlot() {
                         return currentValue;
                     }
 
-
-                    // Somebody else owns it.
-                    // Abort transaction.
 
                     return;
                 }
@@ -550,8 +624,8 @@ async function claimTrafficSlot() {
                 slot;
 
 
-            // Automatically release the slot when
-            // this browser disconnects from Firebase.
+            // Server-side cleanup if the browser
+            // disappears during handshake.
 
             await onDisconnect(
                 slotRef
@@ -570,112 +644,52 @@ async function claimTrafficSlot() {
 
 
 // ============================================================
-// MONITOR ACTIVE USERS
+// RELEASE HANDSHAKE SLOT
 // ============================================================
 
-function startTrafficMonitoring() {
+async function releaseHandshakeSlot() {
 
-    const slotsRef =
-        ref(
-            db,
-            "slots"
+    if (
+        currentSlot === null ||
+        !currentUser
+    ) {
+
+        return;
+    }
+
+
+    const slot =
+        currentSlot;
+
+
+    currentSlot =
+        null;
+
+
+    try {
+
+        await remove(
+            ref(
+                db,
+                "slots/" + slot
+            )
         );
 
+    }
+    catch (error) {
 
-    slotListener =
-        onValue(
-
-            slotsRef,
-
-            (snapshot) => {
-
-                const slots =
-                    snapshot.val() || {};
-
-                const activeUsers =
-                    Object.keys(
-                        slots
-                    ).length;
-
-
-                trafficStatus.textContent =
-                    `Active users: ${activeUsers}/${MAX_ACTIVE_USERS}`;
-
-
-                trafficStatus.className =
-                    "";
-
-
-                if (
-                    activeUsers >=
-                    MAX_ACTIVE_USERS
-                ) {
-
-                    trafficStatus.classList.add(
-                        "warning"
-                    );
-                }
-            },
-
-
-            (error) => {
-
-                console.error(
-                    "Traffic monitor error:",
-                    error
-                );
-
-
-                trafficStatus.textContent =
-                    "Active users: unavailable";
-
-                trafficStatus.className =
-                    "error";
-            }
+        console.warn(
+            "Could not explicitly release slot:",
+            error
         );
+
+        // onDisconnect() is still armed.
+    }
 }
 
 
 // ============================================================
-// HANDLE HIGH TRAFFIC
-// ============================================================
-
-function handleHighTraffic() {
-
-    setFirebaseStatus(
-        "Firebase: available",
-        "success"
-    );
-
-
-    trafficStatus.textContent =
-        "High traffic: please try again later.";
-
-    trafficStatus.className =
-        "error";
-
-
-    setConnectionStatus(
-        "Too many active users right now",
-        "error"
-    );
-
-
-    createConnectionBtn.disabled =
-        true;
-
-
-    messageInput.disabled =
-        true;
-
-
-    sendButton.disabled =
-        true;
-}
-
-
-// ============================================================
-// WAIT FOR ICE GATHERING
+// WAIT FOR ICE
 // ============================================================
 
 function waitForIceGatheringComplete(
@@ -683,7 +697,7 @@ function waitForIceGatheringComplete(
 ) {
 
     return new Promise(
-        (resolve) => {
+        resolve => {
 
             if (
                 pc.iceGatheringState ===
@@ -696,7 +710,7 @@ function waitForIceGatheringComplete(
             }
 
 
-            function checkState() {
+            function check() {
 
                 if (
                     pc.iceGatheringState ===
@@ -705,7 +719,7 @@ function waitForIceGatheringComplete(
 
                     pc.removeEventListener(
                         "icegatheringstatechange",
-                        checkState
+                        check
                     );
 
                     resolve();
@@ -715,7 +729,7 @@ function waitForIceGatheringComplete(
 
             pc.addEventListener(
                 "icegatheringstatechange",
-                checkState
+                check
             );
         }
     );
@@ -723,7 +737,7 @@ function waitForIceGatheringComplete(
 
 
 // ============================================================
-// CREATE WEBRTC PEER CONNECTION
+// CREATE PEER CONNECTION
 // ============================================================
 
 function createPeerConnection() {
@@ -746,17 +760,19 @@ function createPeerConnection() {
 
 
     peerConnection.onconnectionstatechange =
-        () => {
+        async () => {
+
+            const state =
+                peerConnection.connectionState;
+
 
             console.log(
-                "WebRTC connection state:",
-                peerConnection.connectionState
+                "WebRTC connection:",
+                state
             );
 
 
-            switch (
-            peerConnection.connectionState
-            ) {
+            switch (state) {
 
                 case "new":
 
@@ -785,17 +801,40 @@ function createPeerConnection() {
                         "connected"
                     );
 
+
                     waitingMessage.textContent =
-                        "Connected successfully.";
+                        "P2P connection established.";
+
+
+                    joinMessage.textContent =
+                        "P2P connection established.";
+
+
+                    // Remove handshake UI.
+
+                    autoJoinSection.classList.add(
+                        "hidden"
+                    );
+
+
+                    // The important part:
+                    //
+                    // Firebase is no longer needed.
+
+                    await finishSuccessfulHandshake();
 
                     break;
 
 
                 case "disconnected":
 
+                    // Do NOT immediately kill the connection.
+                    //
+                    // WebRTC may recover.
+
                     setConnectionStatus(
-                        "Connection interrupted",
-                        "error"
+                        "P2P temporarily disconnected...",
+                        "connecting"
                     );
 
                     break;
@@ -804,9 +843,12 @@ function createPeerConnection() {
                 case "failed":
 
                     setConnectionStatus(
-                        "Connection failed",
+                        "P2P connection lost",
                         "error"
                     );
+
+
+                    showP2PLostState();
 
                     break;
 
@@ -814,7 +856,8 @@ function createPeerConnection() {
                 case "closed":
 
                     setConnectionStatus(
-                        "Connection closed"
+                        "P2P connection closed",
+                        "error"
                     );
 
                     break;
@@ -826,14 +869,14 @@ function createPeerConnection() {
         () => {
 
             console.log(
-                "ICE state:",
+                "ICE:",
                 peerConnection.iceConnectionState
             );
         };
 
 
     peerConnection.ondatachannel =
-        (event) => {
+        event => {
 
             setupDataChannel(
                 event.channel
@@ -846,7 +889,7 @@ function createPeerConnection() {
 
 
 // ============================================================
-// SETUP DATA CHANNEL
+// DATA CHANNEL
 // ============================================================
 
 function setupDataChannel(
@@ -858,14 +901,18 @@ function setupDataChannel(
 
 
     dataChannel.onopen =
-        () => {
+        async () => {
 
             setConnectionStatus(
                 "Connected • P2P",
                 "connected"
             );
 
+
             updateSendButton();
+
+
+            await finishSuccessfulHandshake();
         };
 
 
@@ -877,7 +924,7 @@ function setupDataChannel(
 
 
     dataChannel.onerror =
-        (error) => {
+        error => {
 
             console.error(
                 "Data channel error:",
@@ -887,7 +934,7 @@ function setupDataChannel(
 
 
     dataChannel.onmessage =
-        (event) => {
+        event => {
 
             receivedTextValue =
                 String(
@@ -906,30 +953,1142 @@ function setupDataChannel(
 
 
 // ============================================================
-// UPDATE SEND BUTTON
+// FINISH SUCCESSFUL HANDSHAKE
 // ============================================================
 
-function updateSendButton() {
-
-    const connected =
-        dataChannel &&
-        dataChannel.readyState ===
-        "open";
+let handshakeFinishStarted =
+    false;
 
 
-    const hasText =
-        messageInput.value.length >
-        0;
+async function finishSuccessfulHandshake() {
+
+    if (
+        handshakeFinishStarted
+    ) {
+
+        return;
+    }
 
 
-    sendButton.disabled =
-        !connected ||
-        !hasText;
+    if (
+        !peerConnection ||
+        peerConnection.connectionState !==
+        "connected"
+    ) {
+
+        return;
+    }
+
+
+    handshakeFinishStarted =
+        true;
+
+    handshakeActive =
+        false;
+
+
+    stopHandshakeTimer();
+
+
+    // Stop Firebase listeners.
+
+    if (
+        answerUnsubscribe
+    ) {
+
+        answerUnsubscribe();
+
+        answerUnsubscribe =
+            null;
+    }
+
+
+    if (
+        roomUnsubscribe
+    ) {
+
+        roomUnsubscribe();
+
+        roomUnsubscribe =
+            null;
+    }
+
+
+    try {
+
+        // Host removes the temporary signaling room.
+
+        if (
+            currentRole === "host" &&
+            currentRoomCode
+        ) {
+
+            await remove(
+                ref(
+                    db,
+                    "rooms/" +
+                    currentRoomCode
+                )
+            );
+        }
+
+
+        // Release this device's handshake slot.
+
+        await releaseHandshakeSlot();
+
+
+    }
+    catch (error) {
+
+        console.warn(
+            "Handshake cleanup error:",
+            error
+        );
+    }
+
+
+    currentRoomCode =
+        null;
+
+    currentRole =
+        null;
+
+
+    // IMPORTANT:
+    //
+    // WebRTC remains alive.
+    //
+    // Firebase is now disconnected.
+
+    try {
+
+        goOffline(db);
+
+        firebaseOnline =
+            false;
+
+
+        setFirebaseStatus(
+            "Firebase: disconnected • P2P active",
+            "success"
+        );
+
+    }
+    catch (error) {
+
+        console.warn(
+            "Could not disconnect Firebase:",
+            error
+        );
+    }
 }
 
 
 // ============================================================
-// CHARACTER COUNTER
+// HANDSHAKE TIMER
+// ============================================================
+
+function startHandshakeTimer() {
+
+    stopHandshakeTimer();
+
+
+    handshakeActive =
+        true;
+
+
+    handshakeTimer =
+        setTimeout(
+            async () => {
+
+                if (
+                    !handshakeActive
+                ) {
+
+                    return;
+                }
+
+
+                await expireHandshake();
+
+            },
+            ROOM_LIFETIME_MS
+        );
+}
+
+
+function stopHandshakeTimer() {
+
+    if (
+        handshakeTimer
+    ) {
+
+        clearTimeout(
+            handshakeTimer
+        );
+
+        handshakeTimer =
+            null;
+    }
+}
+
+
+// ============================================================
+// EXPIRE HANDSHAKE
+// ============================================================
+
+async function expireHandshake() {
+
+    if (
+        !handshakeActive
+    ) {
+
+        return;
+    }
+
+
+    handshakeActive =
+        false;
+
+
+    stopHandshakeTimer();
+
+
+    // Stop Firebase listeners.
+
+    if (
+        answerUnsubscribe
+    ) {
+
+        answerUnsubscribe();
+
+        answerUnsubscribe =
+            null;
+    }
+
+
+    if (
+        roomUnsubscribe
+    ) {
+
+        roomUnsubscribe();
+
+        roomUnsubscribe =
+            null;
+    }
+
+
+    try {
+
+        if (
+            currentRoomCode &&
+            currentRole === "host"
+        ) {
+
+            await remove(
+                ref(
+                    db,
+                    "rooms/" +
+                    currentRoomCode
+                )
+            );
+        }
+
+
+        await releaseHandshakeSlot();
+
+    }
+    catch (error) {
+
+        console.warn(
+            "Handshake expiration cleanup:",
+            error
+        );
+    }
+
+
+    if (
+        peerConnection
+    ) {
+
+        try {
+            peerConnection.close();
+        }
+        catch {
+            // Ignore.
+        }
+
+        peerConnection =
+            null;
+    }
+
+
+    dataChannel =
+        null;
+
+
+    currentRoomCode =
+        null;
+
+    currentRole =
+        null;
+
+
+    clearRoomFromURL();
+
+
+    resetConnectionUI(
+        "Connection expired. Please create a new connection."
+    );
+}
+
+
+// ============================================================
+// RESET CONNECTION UI
+// ============================================================
+
+function resetConnectionUI(
+    message = null
+) {
+
+    stopHandshakeTimer();
+
+
+    hostSection.classList.add(
+        "hidden"
+    );
+
+
+    autoJoinSection.classList.add(
+        "hidden"
+    );
+
+
+    qrCodeElement.innerHTML =
+        "";
+
+
+    roomCodeElement.textContent =
+        "--------";
+
+
+    waitingMessage.textContent =
+        "Waiting for the other device...";
+
+
+    joinMessage.textContent =
+        "Connecting to the other device...";
+
+
+    createConnectionBtn.disabled =
+        false;
+
+
+    if (message) {
+
+        setConnectionStatus(
+            message,
+            "error"
+        );
+
+    }
+    else {
+
+        setConnectionStatus(
+            "Not connected"
+        );
+    }
+
+
+    handshakeActive =
+        false;
+
+    handshakeFinishStarted =
+        false;
+
+
+    updateSendButton();
+}
+
+
+// ============================================================
+// P2P LOST STATE
+// ============================================================
+
+function showP2PLostState() {
+
+    autoJoinSection.classList.add(
+        "hidden"
+    );
+
+
+    waitingMessage.textContent =
+        "The P2P connection was lost. Create a new connection to reconnect.";
+
+
+    createConnectionBtn.disabled =
+        false;
+}
+
+
+// ============================================================
+// HIGH TRAFFIC
+// ============================================================
+
+function handleHighTraffic() {
+
+    trafficStatus.textContent =
+        "High handshake traffic. Please try again shortly.";
+
+    trafficStatus.className =
+        "error";
+
+
+    setConnectionStatus(
+        "Handshake capacity full",
+        "error"
+    );
+
+
+    createConnectionBtn.disabled =
+        false;
+}
+
+
+// ============================================================
+// CREATE CONNECTION
+// ============================================================
+
+createConnectionBtn.addEventListener(
+    "click",
+    async () => {
+
+        try {
+
+            createConnectionBtn.disabled =
+                true;
+
+
+            await ensureFirebaseOnline();
+
+
+            await claimHandshakeSlot();
+
+
+            currentRole =
+                "host";
+
+
+            handshakeFinishStarted =
+                false;
+
+
+            setConnectionStatus(
+                "Creating connection...",
+                "connecting"
+            );
+
+
+            createPeerConnection();
+
+
+            dataChannel =
+                peerConnection.createDataChannel(
+                    "text-share"
+                );
+
+
+            setupDataChannel(
+                dataChannel
+            );
+
+
+            const offer =
+                await peerConnection.createOffer();
+
+
+            await peerConnection.setLocalDescription(
+                offer
+            );
+
+
+            await waitForIceGatheringComplete(
+                peerConnection
+            );
+
+
+            const finalOffer =
+                peerConnection.localDescription;
+
+
+            const offerString =
+                JSON.stringify(
+                    finalOffer
+                );
+
+
+            if (
+                offerString.length >
+                MAX_SIGNALING_SIZE
+            ) {
+
+                throw new Error(
+                    "WebRTC offer is unexpectedly large."
+                );
+            }
+
+
+            currentRoomCode =
+                generateRoomCode();
+
+
+            const createdAt =
+                Date.now();
+
+
+            const expiresAt =
+                createdAt +
+                ROOM_LIFETIME_MS;
+
+
+            const roomPath =
+                "rooms/" +
+                currentRoomCode;
+
+
+            // Atomic multi-location creation.
+            //
+            // Firebase rules validate all fields.
+
+            const updates = {};
+
+
+            updates[
+                roomPath +
+                "/hostUid"
+            ] =
+                currentUser.uid;
+
+
+            updates[
+                roomPath +
+                "/offer"
+            ] =
+                offerString;
+
+
+            updates[
+                roomPath +
+                "/createdAt"
+            ] =
+                createdAt;
+
+
+            updates[
+                roomPath +
+                "/expiresAt"
+            ] =
+                expiresAt;
+
+
+            await update(
+                ref(db),
+                updates
+            );
+
+
+            // If host disappears before handshake,
+            // Firebase deletes the temporary room.
+
+            await onDisconnect(
+                ref(
+                    db,
+                    roomPath
+                )
+            ).remove();
+
+
+            const link =
+                createConnectionLink(
+                    currentRoomCode
+                );
+            currentConnectionLink =
+                link;
+
+            roomCodeElement.textContent =
+                currentRoomCode;
+
+
+            qrCodeElement.innerHTML =
+                "";
+
+
+            new QRCode(
+                qrCodeElement,
+                {
+                    text: link,
+
+                    width: 250,
+
+                    height: 250,
+
+                    correctLevel:
+                        QRCode.CorrectLevel.M
+                }
+            );
+
+
+            hostSection.classList.remove(
+                "hidden"
+            );
+
+
+            waitingMessage.textContent =
+                "Scan the QR code within 1 minute.";
+
+
+            setConnectionStatus(
+                "Waiting for device...",
+                "connecting"
+            );
+
+
+            startHandshakeTimer();
+
+
+            // Listen for answer.
+
+            const answerRef =
+                ref(
+                    db,
+                    roomPath +
+                    "/answer"
+                );
+
+
+            answerUnsubscribe =
+                onValue(
+
+                    answerRef,
+
+                    async snapshot => {
+
+                        const answer =
+                            snapshot.val();
+
+
+                        if (
+                            !answer ||
+                            !peerConnection
+                        ) {
+
+                            return;
+                        }
+
+
+                        try {
+
+                            await peerConnection.setRemoteDescription(
+                                JSON.parse(
+                                    answer
+                                )
+                            );
+
+
+                            waitingMessage.textContent =
+                                "Answer received. Establishing P2P connection...";
+
+                        }
+                        catch (error) {
+
+                            console.error(
+                                "Answer error:",
+                                error
+                            );
+
+
+                            setConnectionStatus(
+                                "Invalid connection response",
+                                "error"
+                            );
+                        }
+                    },
+
+                    error => {
+
+                        console.error(
+                            "Answer listener:",
+                            error
+                        );
+                    }
+                );
+
+        }
+        catch (error) {
+
+            console.error(
+                "Create connection:",
+                error
+            );
+
+
+            if (
+                error.message ===
+                "HIGH_TRAFFIC"
+            ) {
+
+                await releaseHandshakeSlot();
+
+                handleHighTraffic();
+
+                return;
+            }
+
+
+            await releaseHandshakeSlot();
+
+
+            if (
+                peerConnection
+            ) {
+
+                try {
+                    peerConnection.close();
+                }
+                catch {
+                    // Ignore.
+                }
+
+                peerConnection =
+                    null;
+            }
+
+
+            resetConnectionUI(
+                error.message ||
+                "Could not create connection."
+            );
+        }
+    }
+);
+
+
+// ============================================================
+// AUTOMATIC GUEST JOIN
+// ============================================================
+
+async function autoJoinRoom(
+    roomCode
+) {
+
+    try {
+
+        await ensureFirebaseOnline();
+
+
+        // ----------------------------------------------------
+        // First check that the room exists and is not expired.
+        //
+        // We only read the metadata here.
+        // The offer itself remains protected.
+        // ----------------------------------------------------
+
+        const roomMetaRef =
+            ref(
+                db,
+                "rooms/" +
+                roomCode
+            );
+
+
+        const roomSnapshot =
+            await get(
+                roomMetaRef
+            );
+
+
+        if (
+            !roomSnapshot.exists()
+        ) {
+
+            throw new Error(
+                "Connection not found or expired."
+            );
+        }
+
+
+        const room =
+            roomSnapshot.val();
+
+
+        if (
+            !room.expiresAt ||
+            Date.now() >=
+            Number(room.expiresAt)
+        ) {
+
+            throw new Error(
+                "This connection has expired."
+            );
+        }
+
+
+        // ----------------------------------------------------
+        // Claim handshake slot.
+        // ----------------------------------------------------
+
+        await claimHandshakeSlot();
+
+
+        currentRole =
+            "guest";
+
+
+        currentRoomCode =
+            roomCode;
+
+
+        handshakeFinishStarted =
+            false;
+
+
+        // ----------------------------------------------------
+        // Claim guest UID.
+        // ----------------------------------------------------
+
+        const guestUidRef =
+            ref(
+                db,
+                "rooms/" +
+                roomCode +
+                "/guestUid"
+            );
+
+
+        const guestTransaction =
+            await runTransaction(
+
+                guestUidRef,
+
+                currentValue => {
+
+                    if (
+                        currentValue === null
+                    ) {
+
+                        return currentUser.uid;
+                    }
+
+
+                    if (
+                        currentValue ===
+                        currentUser.uid
+                    ) {
+
+                        return currentValue;
+                    }
+
+
+                    return;
+                }
+            );
+
+
+        if (
+            !guestTransaction.committed
+        ) {
+
+            throw new Error(
+                "This connection is already being used."
+            );
+        }
+
+
+        // ----------------------------------------------------
+        // Now that guestUid belongs to us,
+        // read the protected offer.
+        // ----------------------------------------------------
+
+        const offerRef =
+            ref(
+                db,
+                "rooms/" +
+                roomCode +
+                "/offer"
+            );
+
+
+        const offerSnapshot =
+            await get(
+                offerRef
+            );
+
+
+        if (
+            !offerSnapshot.exists()
+        ) {
+
+            throw new Error(
+                "Connection offer is missing."
+            );
+        }
+
+
+        const offer =
+            offerSnapshot.val();
+
+
+        setConnectionStatus(
+            "Creating secure P2P connection...",
+            "connecting"
+        );
+
+
+        joinMessage.textContent =
+            "Creating secure P2P connection...";
+
+
+        createPeerConnection();
+
+
+        await peerConnection.setRemoteDescription(
+            JSON.parse(
+                offer
+            )
+        );
+
+
+        const answer =
+            await peerConnection.createAnswer();
+
+
+        await peerConnection.setLocalDescription(
+            answer
+        );
+
+
+        await waitForIceGatheringComplete(
+            peerConnection
+        );
+
+
+        const finalAnswer =
+            peerConnection.localDescription;
+
+
+        const answerString =
+            JSON.stringify(
+                finalAnswer
+            );
+
+
+        if (
+            answerString.length >
+            MAX_SIGNALING_SIZE
+        ) {
+
+            throw new Error(
+                "WebRTC answer is unexpectedly large."
+            );
+        }
+
+
+        // ----------------------------------------------------
+        // Send answer.
+        // ----------------------------------------------------
+
+        await set(
+            ref(
+                db,
+                "rooms/" +
+                roomCode +
+                "/answer"
+            ),
+            answerString
+        );
+
+
+        joinMessage.textContent =
+            "Connection information sent. Waiting for P2P connection...";
+
+
+        startHandshakeTimer();
+
+
+        // ----------------------------------------------------
+        // Watch the room.
+        //
+        // If host closes/crashes, onDisconnect()
+        // deletes the room and this listener detects it.
+        // ----------------------------------------------------
+
+        roomUnsubscribe =
+            onValue(
+
+                roomMetaRef,
+
+                snapshot => {
+
+                    if (
+                        !snapshot.exists() &&
+                        handshakeActive
+                    ) {
+
+                        expireGuestHandshake(
+                            "The other device cancelled the connection."
+                        );
+                    }
+
+                },
+
+                error => {
+
+                    console.warn(
+                        "Room listener:",
+                        error
+                    );
+                }
+            );
+
+
+        clearRoomFromURL();
+
+    }
+    catch (error) {
+
+        console.error(
+            "Automatic join:",
+            error
+        );
+
+
+        await releaseHandshakeSlot();
+
+
+        if (
+            peerConnection
+        ) {
+
+            try {
+                peerConnection.close();
+            }
+            catch {
+                // Ignore.
+            }
+
+            peerConnection =
+                null;
+        }
+
+
+        dataChannel =
+            null;
+
+
+        currentRoomCode =
+            null;
+
+        currentRole =
+            null;
+
+
+        clearRoomFromURL();
+
+
+        autoJoinSection.classList.remove(
+            "hidden"
+        );
+
+
+        joinMessage.textContent =
+            error.message ||
+            "Could not join the connection.";
+
+
+        setConnectionStatus(
+            "Could not join connection",
+            "error"
+        );
+    }
+}
+
+
+// ============================================================
+// GUEST HANDSHAKE FAILURE
+// ============================================================
+
+async function expireGuestHandshake(
+    message
+) {
+
+    if (
+        !handshakeActive
+    ) {
+
+        return;
+    }
+
+
+    handshakeActive =
+        false;
+
+
+    stopHandshakeTimer();
+
+
+    if (
+        roomUnsubscribe
+    ) {
+
+        roomUnsubscribe();
+
+        roomUnsubscribe =
+            null;
+    }
+
+
+    await releaseHandshakeSlot();
+
+
+    if (
+        peerConnection
+    ) {
+
+        try {
+            peerConnection.close();
+        }
+        catch {
+            // Ignore.
+        }
+
+        peerConnection =
+            null;
+    }
+
+
+    dataChannel =
+        null;
+
+
+    currentRoomCode =
+        null;
+
+    currentRole =
+        null;
+
+
+    clearRoomFromURL();
+
+
+    resetConnectionUI(
+        message
+    );
+}
+
+
+// ============================================================
+// MESSAGE INPUT
 // ============================================================
 
 messageInput.addEventListener(
@@ -950,7 +2109,7 @@ messageInput.addEventListener(
 
 
 // ============================================================
-// SEND MESSAGE
+// SEND
 // ============================================================
 
 sendButton.addEventListener(
@@ -994,17 +2153,19 @@ sendButton.addEventListener(
 
 
 // ============================================================
-// CTRL/CMD + ENTER TO SEND
+// CTRL/CMD + ENTER
 // ============================================================
 
 messageInput.addEventListener(
     "keydown",
-    (event) => {
+    event => {
 
         if (
             event.key === "Enter" &&
-            (event.ctrlKey ||
-                event.metaKey)
+            (
+                event.ctrlKey ||
+                event.metaKey
+            )
         ) {
 
             event.preventDefault();
@@ -1016,7 +2177,30 @@ messageInput.addEventListener(
 
 
 // ============================================================
-// COPY RECEIVED TEXT
+// SEND BUTTON
+// ============================================================
+
+function updateSendButton() {
+
+    const connected =
+        dataChannel &&
+        dataChannel.readyState ===
+        "open";
+
+
+    const hasText =
+        messageInput.value.length >
+        0;
+
+
+    sendButton.disabled =
+        !connected ||
+        !hasText;
+}
+
+
+// ============================================================
+// COPY RECEIVED
 // ============================================================
 
 copyReceivedButton.addEventListener(
@@ -1053,12 +2237,8 @@ copyReceivedButton.addEventListener(
         catch (error) {
 
             console.error(
-                "Clipboard error:",
+                "Clipboard:",
                 error
-            );
-
-            alert(
-                "Could not copy automatically."
             );
         }
     }
@@ -1111,343 +2291,27 @@ copyLinkBtn.addEventListener(
             console.error(
                 error
             );
-
-            alert(
-                "Could not copy the link."
-            );
         }
     }
 );
 
 
 // ============================================================
-// DEVICE A — CREATE CONNECTION
+// START
 // ============================================================
 
-createConnectionBtn.addEventListener(
-    "click",
-    async () => {
+async function startApplication() {
 
-        try {
+    await initializeFirebase();
 
-            if (!currentUser) {
 
-                throw new Error(
-                    "Firebase is not ready."
-                );
-            }
+    const roomFromURL =
+        getRoomFromURL();
 
 
-            if (
-                currentSlot === null
-            ) {
-
-                throw new Error(
-                    "No active connection slot."
-                );
-            }
-
-
-            createConnectionBtn.disabled =
-                true;
-
-
-            setConnectionStatus(
-                "Creating connection...",
-                "connecting"
-            );
-
-
-            createPeerConnection();
-
-
-            // Device A creates the data channel.
-
-            dataChannel =
-                peerConnection.createDataChannel(
-                    "text-share"
-                );
-
-
-            setupDataChannel(
-                dataChannel
-            );
-
-
-            // Create offer.
-
-            const offer =
-                await peerConnection.createOffer();
-
-
-            await peerConnection.setLocalDescription(
-                offer
-            );
-
-
-            // Wait until ICE candidates have been
-            // gathered into the SDP.
-
-            await waitForIceGatheringComplete(
-                peerConnection
-            );
-
-
-            const finalOffer =
-                peerConnection.localDescription;
-
-
-            const offerString =
-                JSON.stringify(
-                    finalOffer
-                );
-
-
-            if (
-                offerString.length >
-                MAX_SIGNALING_SIZE
-            ) {
-
-                throw new Error(
-                    "The signaling offer is unexpectedly large."
-                );
-            }
-
-
-            // Create room.
-
-            currentRoomCode =
-                generateRoomCode();
-
-
-            const roomRef =
-                ref(
-                    db,
-                    "rooms/" +
-                    currentRoomCode
-                );
-
-
-            // Create host identity.
-
-            await set(
-                ref(
-                    db,
-                    "rooms/" +
-                    currentRoomCode +
-                    "/hostUid"
-                ),
-                currentUser.uid
-            );
-
-
-            // Store offer.
-
-            await set(
-                ref(
-                    db,
-                    "rooms/" +
-                    currentRoomCode +
-                    "/offer"
-                ),
-                offerString
-            );
-
-
-            // Create connection link.
-
-            currentConnectionLink =
-                createConnectionLink(
-                    currentRoomCode
-                );
-
-
-            // Display room code.
-
-            roomCodeElement.textContent =
-                currentRoomCode;
-
-
-            // Generate QR.
-
-            qrCodeElement.innerHTML =
-                "";
-
-
-            new QRCode(
-                qrCodeElement,
-                {
-                    text:
-                        currentConnectionLink,
-
-                    width: 250,
-
-                    height: 250,
-
-                    correctLevel:
-                        QRCode.CorrectLevel.M
-                }
-            );
-
-
-            hostSection.classList.remove(
-                "hidden"
-            );
-
-
-            setConnectionStatus(
-                "Waiting for device...",
-                "connecting"
-            );
-
-
-            // Listen for answer.
-
-            const answerRef =
-                ref(
-                    db,
-                    "rooms/" +
-                    currentRoomCode +
-                    "/answer"
-                );
-
-
-            answerListener =
-                onValue(
-
-                    answerRef,
-
-                    async (snapshot) => {
-
-                        const answer =
-                            snapshot.val();
-
-
-                        if (!answer) {
-                            return;
-                        }
-
-
-                        if (
-                            !peerConnection
-                        ) {
-                            return;
-                        }
-
-
-                        try {
-
-                            await peerConnection.setRemoteDescription(
-                                JSON.parse(
-                                    answer
-                                )
-                            );
-
-
-                            waitingMessage.textContent =
-                                "Answer received. Establishing P2P connection...";
-
-
-                            setConnectionStatus(
-                                "Establishing P2P connection...",
-                                "connecting"
-                            );
-
-
-                        }
-                        catch (error) {
-
-                            console.error(
-                                "Failed to apply answer:",
-                                error
-                            );
-
-
-                            setConnectionStatus(
-                                "Invalid connection response",
-                                "error"
-                            );
-                        }
-
-                    },
-
-                    (error) => {
-
-                        console.error(
-                            "Answer listener error:",
-                            error
-                        );
-                    }
-                );
-
-
-        }
-        catch (error) {
-
-            console.error(
-                "Create connection error:",
-                error
-            );
-
-
-            createConnectionBtn.disabled =
-                false;
-
-
-            if (
-                error.message ===
-                "HIGH_TRAFFIC"
-            ) {
-
-                handleHighTraffic();
-
-                return;
-            }
-
-
-            setConnectionStatus(
-                error.message ||
-                "Could not create connection.",
-                "error"
-            );
-        }
-    }
-);
-
-
-// ============================================================
-// AUTOMATIC JOIN
-// ============================================================
-//
-// If the phone opens:
-//
-// https://site.github.io/project/?room=ABC123
-//
-// the application automatically joins the room.
-//
-
-async function autoJoinRoom(
-    roomCode
-) {
-
-    try {
-
-        if (!currentUser) {
-
-            throw new Error(
-                "Firebase is not ready."
-            );
-        }
-
-
-        if (!roomCode) {
-            return;
-        }
-
-
-        currentRoomCode =
-            roomCode;
-
+    if (
+        roomFromURL
+    ) {
 
         autoJoinSection.classList.remove(
             "hidden"
@@ -1463,372 +2327,6 @@ async function autoJoinRoom(
             "connecting"
         );
 
-
-        const roomRef =
-            ref(
-                db,
-                "rooms/" +
-                roomCode
-            );
-
-
-        // First claim the guest slot in the room.
-        //
-        // This also allows our security rules to know
-        // who is allowed to read the room.
-
-        const guestUidRef =
-            ref(
-                db,
-                "rooms/" +
-                roomCode +
-                "/guestUid"
-            );
-
-
-        const guestTransaction =
-            await runTransaction(
-                guestUidRef,
-
-                (currentValue) => {
-
-                    if (
-                        currentValue === null
-                    ) {
-
-                        return currentUser.uid;
-                    }
-
-
-                    if (
-                        currentValue ===
-                        currentUser.uid
-                    ) {
-
-                        return currentValue;
-                    }
-
-
-                    // Someone else already joined.
-
-                    return;
-                }
-            );
-
-
-        if (
-            !guestTransaction.committed
-        ) {
-
-            throw new Error(
-                "This connection is already being used."
-            );
-        }
-
-
-        // Now the guest is authorized to read
-        // the room.
-
-        const roomSnapshot =
-            await get(
-                roomRef
-            );
-
-
-        if (
-            !roomSnapshot.exists()
-        ) {
-
-            throw new Error(
-                "Connection not found or expired."
-            );
-        }
-
-
-        const room =
-            roomSnapshot.val();
-
-
-        if (!room.offer) {
-
-            throw new Error(
-                "Connection offer is missing."
-            );
-        }
-
-
-        joinMessage.textContent =
-            "Creating secure P2P connection...";
-
-
-        // Create peer.
-
-        createPeerConnection();
-
-
-        // Apply offer.
-
-        await peerConnection.setRemoteDescription(
-            JSON.parse(
-                room.offer
-            )
-        );
-
-
-        // Generate answer.
-
-        const answer =
-            await peerConnection.createAnswer();
-
-
-        await peerConnection.setLocalDescription(
-            answer
-        );
-
-
-        await waitForIceGatheringComplete(
-            peerConnection
-        );
-
-
-        const finalAnswer =
-            peerConnection.localDescription;
-
-
-        const answerString =
-            JSON.stringify(
-                finalAnswer
-            );
-
-
-        if (
-            answerString.length >
-            MAX_SIGNALING_SIZE
-        ) {
-
-            throw new Error(
-                "The signaling answer is unexpectedly large."
-            );
-        }
-
-
-        // Send answer to Firebase.
-
-        await set(
-            ref(
-                db,
-                "rooms/" +
-                roomCode +
-                "/answer"
-            ),
-            answerString
-        );
-
-
-        joinMessage.textContent =
-            "Connection information sent. Waiting for P2P connection...";
-
-
-        clearRoomFromURL();
-
-
-    }
-    catch (error) {
-
-        console.error(
-            "Automatic join failed:",
-            error
-        );
-
-
-        if (
-            error.message ===
-            "Connection not found or expired."
-        ) {
-
-            joinMessage.textContent =
-                "This connection has expired.";
-
-        }
-        else {
-
-            joinMessage.textContent =
-                error.message ||
-                "Could not join the connection.";
-        }
-
-
-        setConnectionStatus(
-            "Could not join connection",
-            "error"
-        );
-    }
-}
-
-
-// ============================================================
-// CLEAN UP ROOM
-// ============================================================
-//
-// Host deletes the temporary signaling room after
-// the WebRTC connection has successfully been established.
-//
-// This keeps Firebase clean.
-//
-
-async function cleanupRoom() {
-
-    if (
-        !currentRoomCode ||
-        !currentUser
-    ) {
-
-        return;
-    }
-
-
-    try {
-
-        const roomRef =
-            ref(
-                db,
-                "rooms/" +
-                currentRoomCode
-            );
-
-
-        const snapshot =
-            await get(
-                roomRef
-            );
-
-
-        if (
-            !snapshot.exists()
-        ) {
-            return;
-        }
-
-
-        const room =
-            snapshot.val();
-
-
-        if (
-            room.hostUid ===
-            currentUser.uid
-        ) {
-
-            await remove(
-                roomRef
-            );
-        }
-
-    }
-    catch (error) {
-
-        console.warn(
-            "Room cleanup failed:",
-            error
-        );
-    }
-}
-
-
-// ============================================================
-// CLEANUP WHEN PAGE IS CLOSED
-// ============================================================
-
-window.addEventListener(
-    "beforeunload",
-    () => {
-
-        // onDisconnect handles slot cleanup
-        // server-side, so we don't rely on
-        // beforeunload for important cleanup.
-
-        if (
-            peerConnection
-        ) {
-
-            try {
-                peerConnection.close();
-            }
-            catch {
-                // Ignore.
-            }
-        }
-    }
-);
-
-
-// ============================================================
-// CLEANUP AFTER P2P CONNECTION
-// ============================================================
-
-let cleanupTimerStarted =
-    false;
-
-
-function startRoomCleanupTimer() {
-
-    if (cleanupTimerStarted) {
-        return;
-    }
-
-
-    cleanupTimerStarted =
-        true;
-
-
-    setTimeout(
-        () => {
-
-            cleanupRoom();
-
-        },
-        5000
-    );
-}
-
-
-// Watch for successful connection.
-
-setInterval(
-    () => {
-
-        if (
-            peerConnection &&
-            peerConnection.connectionState ===
-            "connected"
-        ) {
-
-            startRoomCleanupTimer();
-
-        }
-
-    },
-    1000
-);
-
-
-// ============================================================
-// START APPLICATION
-// ============================================================
-
-async function startApplication() {
-
-    await initializeFirebase();
-
-
-    // If this page was opened from a QR code,
-    // automatically join the room.
-
-    const roomFromURL =
-        getRoomFromURL();
-
-
-    if (roomFromURL) {
 
         await autoJoinRoom(
             roomFromURL
