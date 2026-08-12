@@ -407,10 +407,6 @@ async function initializeFirebase() {
             result.user;
 
 
-        console.log(
-            "Firebase Auth UID:",
-            currentUser.uid
-        );
 
 
         setFirebaseStatus(
